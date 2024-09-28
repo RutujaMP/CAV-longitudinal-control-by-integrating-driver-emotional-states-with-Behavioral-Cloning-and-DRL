@@ -8,6 +8,9 @@ from tqdm import tqdm
 from copy import copy, deepcopy
 from collections import OrderedDict, defaultdict, Counter
 import warnings
+import os
+import platform
+import shutil
 warnings.filterwarnings('ignore')
 
 from io import StringIO
@@ -99,7 +102,7 @@ def save_pickle(path, obj):
         pickle.dump(obj, f)
 
 def wget(link, output_dir):
-    cmd = 'wget %s -P %s' % (link, output_dir)
+    cmd = 'curl -o %s %s' % (os.path.join(output_dir, os.path.basename(link)), link)
     shell(cmd)
     output_path = Path(output_dir) / os.path.basename(link)
     if not output_path.exists(): raise RuntimeError('Failed to run %s' % cmd)
@@ -136,10 +139,24 @@ def shell(cmd, wait=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE):
     return out.decode().rstrip('\n') if out else '', err.decode().rstrip('\n') if err else ''
 
 def terminal_height():
-    return int(shell('tput lines')[0])
+    if platform.system() == "Windows":
+        try:
+            size = os.get_terminal_size()
+            return size.lines
+        except OSError:
+            return 24  # Default terminal height if the terminal size cannot be determined
+    else:
+        return int(shell('stty size')[0])
 
 def terminal_width():
-    return int(shell('tput cols')[0])
+    if platform.system() == "Windows":
+        try:
+            size = os.get_terminal_size()
+            return size.columns
+        except OSError:
+            return 80  # Default terminal width if the terminal size cannot be determined
+    else:
+        return int(shell('stty size')[1])
 
 def git_state(dir=None):
     cwd = os.getcwd()
@@ -162,8 +179,10 @@ def source(obj):
     print(inspect.getsource(obj))
 
 def import_module(module_name, module_path):
-    import imp
-    module = imp.load_source(module_name, module_path)
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
     return module
 
 def str2num(s):
@@ -276,8 +295,8 @@ class Logger:
             df_new[self.columns_saved].to_csv(self.save_path, header=False, mode='a', index=False)
 
 def installed(pkg):
-    out, err = shell('dpkg -l %s' % pkg)
-    if err and err.startswith('dpkg-query: no packages found matching'):
+    out, err = shell('choco list --localonly %s' % pkg)
+    if err and err.startswith('Chocolatey reported an error'):
         return False
     return True
 
@@ -291,7 +310,7 @@ def install(pkgs, root):
         print('Processing %s' % pkg)
         if installed(pkg) or pkg in self_installed:
             continue
-        out, err = shell('apt-cache depends %s' % pkg)
+        out, err = shell('choco install %s' % pkg)
         deps = []
         for x in out.split('\n'):
             x = x.lstrip()
@@ -304,7 +323,7 @@ def install(pkgs, root):
         print('Found needed dependencies %s for %s' % (deps, pkg))
         pkgs.extend(deps)
         tmp = Path('tmp')
-        shell('mkdir tmp && cd tmp && apt download %s' % pkg)
+        shell('mkdir tmp && cd tmp && choco download %s' % pkg)
         for deb in tmp.glob('*.deb'):
             shell('dpkg -x %s .' % deb)
             print('Installing %s with %s' % (pkg, deb))
@@ -866,6 +885,9 @@ class Config(Namespace):
         super(Config, self).__init__()
         self.load()
         self.var(*args, **kwargs)
+        from gym.spaces import Box, Dict
+
+
         self.setdefaults(
             name=self.res._real._name,
             main=True,
@@ -873,8 +895,10 @@ class Config(Namespace):
             device='cuda' if torch.cuda.is_available() else 'cpu',
             debug=False,
             opt_level='O0',
-            disable_amp=False
+            disable_amp=False,
+
         )
+
 
     def __repr__(self):
         return format_yaml(dict(self))
@@ -1058,21 +1082,58 @@ class Config(Namespace):
             return []
         return sorted([x for x in map(self.model_step, save_paths) if x is not None])
 
+    # def set_state(self, net, opt=None, step='max', path=None):
+    #     state = self.load_state(step=step, path=path)
+    #     if state is None:
+    #         return 0
+    #     if self.get('append_module_before_load'):
+    #         state['net'] = OrderedDict(('module.' + k, v) for k, v in state['net'].items())
+    #     net.load_state_dict(state['net'])
+    #     if opt:
+    #         if 'opt' in state:
+    #             opt.load_state_dict(state['opt'])
+    #         else:
+    #             self.log('No state for optimizer to load')
+    #     if 'amp' in state and self.opt_level != 'O0':
+    #         amp.load_state_dict(state['amp'])
+    #     return state.get('step', 0)
+
     def set_state(self, net, opt=None, step='max', path=None):
         state = self.load_state(step=step, path=path)
         if state is None:
             return 0
-        if self.get('append_module_before_load'):
-            state['net'] = OrderedDict(('module.' + k, v) for k, v in state['net'].items())
-        net.load_state_dict(state['net'])
-        if opt:
-            if 'opt' in state:
-                opt.load_state_dict(state['opt'])
+
+        model_dict = net.state_dict()
+        state_dict = state['net']
+
+        # Handle mismatches and catch errors
+        filtered_dict = {}
+        for k, v in state_dict.items():
+            if k in model_dict:
+                if v.size() == model_dict[k].size():
+                    filtered_dict[k] = v
+                else:
+                    self.log(f"Size mismatch for {k}: expected {model_dict[k].size()}, got {v.size()}")
             else:
-                self.log('No state for optimizer to load')
+                self.log(f"Key {k} not found in current model")
+
+        # Load the updated state dict into the model
+        try:
+            model_dict.update(filtered_dict)
+            net.load_state_dict(model_dict)
+        except RuntimeError as e:
+            self.log(f"Error loading state_dict: {e}")
+
+        if opt and 'opt' in state:
+            opt.load_state_dict(state['opt'])
+        else:
+            self.log('No state for optimizer to load')
+
         if 'amp' in state and self.opt_level != 'O0':
             amp.load_state_dict(state['amp'])
+
         return state.get('step', 0)
+
 
     @main_only
     def get_state(self, net, opt, step):

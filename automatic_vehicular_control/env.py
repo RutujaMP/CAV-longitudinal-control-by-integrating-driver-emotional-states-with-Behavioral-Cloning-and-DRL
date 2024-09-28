@@ -1,6 +1,7 @@
 from lxml.etree import Element, SubElement, tostring, XMLParser
 from xml.etree import ElementTree
 import subprocess
+import os
 import sumolib
 import traci
 import traci.constants as T # https://sumo.dlr.de/pydoc/traci.constants.html
@@ -8,9 +9,23 @@ from traci.exceptions import FatalTraCIError, TraCIException
 import bisect
 import warnings
 import gym
-
+import numpy as np
+import itertools
+import inspect
+import pandas as pd
+from collections import defaultdict
 from automatic_vehicular_control.u import *
 from automatic_vehicular_control.ut import *
+import joblib
+
+
+current_vehicle_type = None
+
+# Load the Behavioral Cloning model for predicting adjustments
+prediction_model = joblib.load('C:/automatic_vehicular_control/models/bc_prediction_model.joblib')
+
+# Load the psychological states dataset
+psych_data = pd.read_csv('C:/automatic_vehicular_control/final_merged_data.csv')
 
 def val_to_str(x):
     return str(x).lower() if isinstance(x, bool) else str(x)
@@ -31,11 +46,16 @@ def values_str_to_val(x):
         x[k] = str_to_val(v)
     return x
 
+def save_bytes(path, content):
+    with open(path, 'wb') as f:
+        f.write(content)
+
 class E(list):
     """
     Builder for lxml.etree.Element
     """
-    xsi = Path('F') / 'resources' / 'xml' / 'XMLSchema-instance' # http://www.w3.org/2001/XMLSchema-instance
+    #xsi = os.path.join('F', 'resources', 'xml', 'XMLSchema-instance') # http://www.w3.org/2001/XMLSchema-instance
+    xsi = 'http://www.w3.org/2001/XMLSchema-instance'  # Use URL for URI
     root_args = dict(nsmap=dict(xsi=xsi))
     def __init__(self, _name, *args, **kwargs):
         assert all(isinstance(a, E) for a in args)
@@ -88,7 +108,7 @@ class E(list):
         return tostring(self.to_element(), pretty_print=True, encoding='UTF-8', xml_declaration=True)
 
     def to_path(self, p):
-        p.save_bytes(self.to_string())
+        save_bytes(p, self.to_string())
 
     def children(self, tag):
         return [x for x in self if x._name == tag]
@@ -232,11 +252,18 @@ class NetBuilder:
         self.connections = {}
         self.additional = []
 
+    # def add_nodes(self, node_infos):
+    #     nodes = [E('node', **n.setdefaults(id=f'n_{n.x}.{n.y}')) for n in node_infos]
+    #     self.nodes.update((n.id, n) for n in nodes)
+    #     ret = np.empty(len(nodes), dtype=object)
+    #     ret[:] = nodes
+    #     return ret
     def add_nodes(self, node_infos):
         nodes = [E('node', **n.setdefaults(id=f'n_{n.x}.{n.y}')) for n in node_infos]
         self.nodes.update((n.id, n) for n in nodes)
         ret = np.empty(len(nodes), dtype=object)
-        ret[:] = nodes
+        for i, node in enumerate(nodes):
+            ret[i] = node
         return ret
 
     def chain(self, nodes, lane_maps=None, edge_attrs={}, route_id=None):
@@ -371,8 +398,8 @@ class SumoDef:
     3. Start the SUMO simulation as a subprocess
     """
     no_ns_attr = '{%s}noNamespaceSchemaLocation' % E.xsi
-    xsd = Path.env('F') / 'resources' / 'xml' / '%s_file.xsd' # http://sumo.dlr.de/xsd/%s_file.xsd For all other defs except viewsettings
-    config_xsd = Path.env('F') / 'resources' / 'xml' / 'sumoConfiguration.xsd' # http://sumo.dlr.de/xsd/sumoConfiguration.xsd
+    xsd = 'http://sumo.dlr.de/xsd/%s_file.xsd'  # Use URL for XSD path
+    config_xsd = 'http://sumo.dlr.de/xsd/sumoConfiguration.xsd'  # Use URL for XSD path
     # see https://sumo.dlr.de/docs/NETCONVERT.html
     netconvert_args = dict(nodes='n', edges='e', connections='x', types='t')
     config_args = dict(
@@ -383,16 +410,16 @@ class SumoDef:
 
     def __init__(self, c):
         self.c = c
-        self.dir = c.res.rel() / 'sumo'
+        self.dir = os.path.join(c.res.rel(), 'sumo')
         if 'i_worker' in c:
-            self.dir /= c.i_worker
-        self.dir.mk() # Use relative path here to shorten sumo arguments
+            self.dir = os.path.join(self.dir, str(c.i_worker))
+        os.makedirs(self.dir, exist_ok=True)  # Use relative path here to shorten sumo arguments
         self.sumo_cmd = None
 
     def save(self, *args, **kwargs):
         for e in args:
             e[SumoDef.no_ns_attr] = SumoDef.xsd % e._name
-            kwargs[e._name] = path = self.dir / e._name[:3] + '.xml'
+            kwargs[e._name] = path = os.path.join(self.dir, e._name[:3] + '.xml')
             e.to_path(path)
         return Namespace(**kwargs)
 
@@ -402,27 +429,26 @@ class SumoDef:
         })
 
         # https://sumo.dlr.de/docs/NETCONVERT.html
-        dyld_env_var = os.environ.get('DYLD_LIBRARY_PATH')
-        net_path = self.dir / 'net.xml'
-        args = [*lif(dyld_env_var, f'DYLD_LIBRARY_PATH={dyld_env_var}'), 'netconvert', '-o', net_path]
+        net_path = os.path.join(self.dir, 'net.xml')
+        args = ['netconvert', '-o', net_path]
         for name, arg in SumoDef.netconvert_args.items():
             path = kwargs.pop(name, None)
             if path:
-                args.append('-%s %s' % (arg, path))
-        args.extend('--%s %s' % (k, val_to_str(v)) for k, v in net_args.items())
+                args.append(f'-{arg} {path}')
+        args.extend(f'--{k} {val_to_str(v)}' for k, v in net_args.items())
 
         cmd = ' '.join(args)
         self.c.log(cmd)
-        out, err = shell(cmd, stdout=None)
+        out, err = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()
         if err:
-            self.c.log(err)
+            self.c.log(err.decode())
 
         return net_path
 
     def generate_sumo(self, **kwargs):
         c = self.c
 
-        gui_path = self.dir / 'gui.xml'
+        gui_path = os.path.join(self.dir, 'gui.xml')
         E('viewsettings',
             E('scheme', name='real world'),
             E('background',
@@ -451,7 +477,7 @@ class SumoDef:
         })
         cmd = ['sumo-gui' if c.render else 'sumo']
         for k, v in sumo_args.items():
-            cmd.extend(['--%s' % k, val_to_str(v)] if v is not None else [])
+            cmd.extend([f'--{k}', val_to_str(v)] if v is not None else [])
         c.log(' '.join(cmd))
         return cmd
 
@@ -466,14 +492,16 @@ class SumoDef:
                     else:
                         self.port = sumolib.miscutils.getFreeSocketPort()
                     # Taken from traci.start but add the DEVNULL here
-                    p = subprocess.Popen(self.sumo_cmd + ['--remote-port', f'{self.port}'], **dif(self.c.get('sumo_no_errors', True), stderr=subprocess.DEVNULL))
+                    print("sumo command",self.sumo_cmd)
+                    p = subprocess.Popen(self.sumo_cmd + ['--remote-port', f'{self.port}'], stderr=subprocess.DEVNULL, stdout=subprocess.PIPE)
                     tc = traci.connect(self.port, 10, 'localhost', p)
                 return tc
-            except traci.exceptions.FatalTraCIError: # Sometimes there's an unknown error while starting SUMO
+            except traci.exceptions.FatalTraCIError:  # Sometimes there's an unknown error while starting SUMO
                 if tc:
                     tc.close()
                 self.c.log('Restarting SUMO...')
                 tc = None
+
 
 class Namespace(Namespace):
     """
@@ -845,32 +873,68 @@ class TrafficState:
         for tl_id in self.traffic_lights.keys():
             subscribes.tl.subscribe(tl_id)
 
+    # def compute_type(self, veh_id):
+    #     """
+    #     If using 'generic' as the vehicle type, dynamically assign the vehicle type after the vehicle inflows
+    #     """
+    #     c = self.c
+    #     av_frac = c.av_frac
+    #     if '.' not in veh_id: # initialized vehicle but not from flow
+    #         return 'human'
+    #     flow_id, _ = veh_id.rsplit('.')
+    #     flow = self.flows[flow_id]
+    #     if type(c.generic_type) in (float, int): # Cannot use isinstance here since we don't want True to land in this branch
+    #         assert av_frac == 0.5
+    #         keep_prob = c.generic_type
+    #         flow.last_rl = is_rl = np.random.rand() < (keep_prob if flow.last_rl else (1 - keep_prob))
+    #     elif isinstance(c.generic_type, tuple):
+    #         assert av_frac == 0.5
+    #         keep_prob_rl, keep_prob_human = c.generic_type
+    #         flow.last_rl = is_rl = np.random.rand() < (keep_prob_rl if flow.last_rl else (1 - keep_prob_human))
+    #     elif c.generic_type == 'rand':
+    #         is_rl = np.random.rand() < av_frac
+    #     else:
+    #         flow.count = veh_index = flow.count + 1
+    #         cycle = int(np.ceil(veh_index * av_frac))
+    #         last_cycle = int(np.ceil((veh_index - 1) * av_frac))
+    #         is_rl = cycle > last_cycle
+    #     return 'rl' if is_rl else 'human'
+
     def compute_type(self, veh_id):
-        """
-        If using 'generic' as the vehicle type, dynamically assign the vehicle type after the vehicle inflows
-        """
+        global current_vehicle_type  # Declare the global variable
+
         c = self.c
         av_frac = c.av_frac
-        if '.' not in veh_id: # initialized vehicle but not from flow
-            return 'human'
-        flow_id, _ = veh_id.rsplit('.')
-        flow = self.flows[flow_id]
-        if type(c.generic_type) in (float, int): # Cannot use isinstance here since we don't want True to land in this branch
-            assert av_frac == 0.5
-            keep_prob = c.generic_type
-            flow.last_rl = is_rl = np.random.rand() < (keep_prob if flow.last_rl else (1 - keep_prob))
-        elif isinstance(c.generic_type, tuple):
-            assert av_frac == 0.5
-            keep_prob_rl, keep_prob_human = c.generic_type
-            flow.last_rl = is_rl = np.random.rand() < (keep_prob_rl if flow.last_rl else (1 - keep_prob_human))
-        elif c.generic_type == 'rand':
-            is_rl = np.random.rand() < av_frac
+        
+        if '.' not in veh_id:  # This checks if the vehicle ID is not derived from a flow.
+            vehicle_type = 'human'
         else:
-            flow.count = veh_index = flow.count + 1
-            cycle = int(np.ceil(veh_index * av_frac))
-            last_cycle = int(np.ceil((veh_index - 1) * av_frac))
-            is_rl = cycle > last_cycle
-        return 'rl' if is_rl else 'human'
+            flow_id, _ = veh_id.rsplit('.')
+            flow = self.flows[flow_id]
+            
+            if type(c.generic_type) in (float, int):  # If `generic_type` is a probability or fixed ratio.
+                assert av_frac == 0.5
+                keep_prob = c.generic_type
+                flow.last_rl = is_rl = np.random.rand() < (keep_prob if flow.last_rl else (1 - keep_prob))
+            elif isinstance(c.generic_type, tuple):  # If `generic_type` is a tuple representing probabilities.
+                assert av_frac == 0.5
+                keep_prob_rl, keep_prob_human = c.generic_type
+                flow.last_rl = is_rl = np.random.rand() < (keep_prob_rl if flow.last_rl else (1 - keep_prob_human))
+            elif c.generic_type == 'rand':  # If `generic_type` is 'rand', assign randomly based on `av_frac`.
+                is_rl = np.random.rand() < av_frac
+            else:  # Fallback logic for assigning types based on vehicle index.
+                flow.count = veh_index = flow.count + 1
+                cycle = int(np.ceil(veh_index * av_frac))
+                last_cycle = int(np.ceil((veh_index - 1) * av_frac))
+                is_rl = cycle > last_cycle
+            
+            vehicle_type = 'rl' if is_rl else 'human'
+
+        # Update the global variable with the current vehicle type
+        current_vehicle_type = vehicle_type
+    
+        return vehicle_type
+
 
     def step(self):
         """
@@ -914,7 +978,11 @@ class TrafficState:
                 color_fn = c.get('color_fn', lambda veh: RED if 'rl' in type_.id else WHITE)
                 self.set_color(veh, color_fn(veh))
 
-            tc.vehicle.setSpeedMode(veh_id, c.get('speed_mode', SPEED_MODE.all_checks))
+            # Ensure speed_mode is an integer
+            speed_mode = c.get('speed_mode', SPEED_MODE.all_checks)
+            if isinstance(speed_mode, str):
+                speed_mode = getattr(SPEED_MODE, speed_mode, SPEED_MODE.all_checks)
+            tc.vehicle.setSpeedMode(veh_id, speed_mode)
             tc.vehicle.setLaneChangeMode(veh_id, c.get('lc_mode', LC_MODE.no_lat_collide))
             self.new_departed.add(veh)
             if '.' in veh_id:
@@ -1026,6 +1094,8 @@ class Env:
         self.sumo_def = SumoDef(c)
         self.tc = None
         self.ts = None
+        self.vehicle_driver_map = {} 
+        self.latest_step_result = None
         self.rollout_info = NamedArrays()
         self._vehicle_info = self._agent_info = None
         if c.get('vehicle_info_save'):
@@ -1034,35 +1104,206 @@ class Env:
                 self._agent_info = []
         self._step = 0
 
+        # Define action space
+        self.action_space = Box(low=-1, high=1, shape=(1,), dtype=np.float32)  # Example action space
+
+        # Define the observation spaces for human-driven and RL-driven vehicles
+        self.human_observation_space = Dict({
+            'adjusted_speed': Box(low=0, high=150, shape=(1,), dtype=np.float32),
+            'adjusted_accel': Box(low=-10, high=10, shape=(1,), dtype=np.float32),
+            'valence': Box(low=1, high=9, shape=(1,), dtype=np.float32),
+            'arousal': Box(low=1, high=9, shape=(1,), dtype=np.float32),
+            'emotion_state': Box(low=0, high=1, shape=(7,), dtype=np.float32)  # Assuming 7 possible states
+        })
+
+        self.rl_observation_space = Box(low=c.low, high=1, shape=(c._n_obs_non_human,), dtype=np.float32)
+
+        print("current vehicle type",current_vehicle_type)
+
+        if current_vehicle_type == 'human':
+            print("entered the human observation space")
+            self.observation_space = self.human_observation_space
+        else:
+            print("entered the other observation space")
+            self.observation_space = self.rl_observation_space
+
+        print("observation_space is set in Env",self.observation_space)
+
+        self.driver_data = {}
+        
+    def assign_driver_data(self, psych_data):
+        ts = self.ts
+        """Assign the psychological state data to each driver."""
+        participants = psych_data['participant'].unique()
+        self.participant_data = {p: psych_data[psych_data['participant'] == p].iterrows() for p in participants}
+
+        # Loop over vehicles and assign driver data only to human-driven vehicles
+        self.vehicle_driver_map = {}
+        participant_list = list(participants)
+        num_participants = len(participant_list)
+        #human_vehicles = [v for v in range(len(ts.vehicles.rl)) if v.type == 'human']
+        human_vehicles = [v for v in ts.vehicles.values() if v.type.id == 'human']
+        for i, vehicle in enumerate(human_vehicles):
+            participant_index = i % num_participants  # Loop through participants
+            self.vehicle_driver_map[vehicle] = participant_list[participant_index]
+
+    def get_driver_state(self, vehicle_id):
+        """Retrieve the next set of valence, arousal, and emotion state values sequentially for a given driver."""
+        driver_id = self.vehicle_driver_map.get(vehicle_id, None)
+        if driver_id is None:
+            # If the vehicle is not human-driven, return default values
+            return None, None, None
+
+        try:
+            current_state = next(self.participant_data[driver_id])[1]
+        except StopIteration:
+            # If we've reached the end of the data for this driver, loop back to the start
+            self.participant_data[driver_id] = psych_data[psych_data['participant'] == driver_id].iterrows()
+            current_state = next(self.participant_data[driver_id])[1]
+        
+        valence = current_state['valence']
+        arousal = current_state['arousal']
+        emotion_state = current_state['emotion_state']
+
+        return valence, arousal, emotion_state
+    
+    def adjust_idm_output_with_psychology(idm_acceleration, idm_speed, valence, arousal, emotion_state, prediction_model):
+    # Prepare the input features for the prediction model
+        emotion_mapping = {
+            'AD': [1, 0, 0, 0, 0, 0, 0],
+            'DD': [0, 1, 0, 0, 0, 0, 0],
+            'FD': [0, 0, 1, 0, 0, 0, 0],
+            'HD': [0, 0, 0, 1, 0, 0, 0],
+            'ND': [0, 0, 0, 0, 1, 0, 0],
+            'SAD': [0, 0, 0, 0, 0, 1, 0],
+            'SD': [0, 0, 0, 0, 0, 0, 1]
+        }
+        emotion_encoded = emotion_mapping[emotion_state]
+        input_features = np.array([[valence, arousal] + emotion_encoded])
+        
+        # Predict the adjustment factors using the behavioral cloning model
+        adjustment = prediction_model.predict(input_features)[0]
+        
+        # Adjust the IDM outputs
+        adjusted_acceleration = idm_acceleration * adjustment[0]
+        adjusted_speed = idm_speed * adjustment[1]
+        
+        return adjusted_acceleration, adjusted_speed
+
     def def_sumo(self, *args, **kwargs):
         """ Override this with code defining the SUMO network """
         # https://sumo.dlr.de/docs/Networks/PlainXML.html
         # https://sumo.dlr.de/docs/Definition_of_Vehicles,_Vehicle_Types,_and_Routes.html
         return self.sumo_def.save(*args, **kwargs)
 
+
     def step(self, *args):
         """
-        Override this with additional code which applies acceleration and measures observation and reward
+        This method advances the simulation by one step and collects observations
+        for each vehicle, including psychological states for human-driven vehicles.
         """
         c, ts = self.c, self.ts
-        if c.get('custom_idm'):
-            idm = c.custom_idm
-            for veh in ts.types.human.vehicles:
-                leader, headway = veh.leader()
-                v = veh.speed
-                s_star = 0 if leader is None else idm.minGap + max(0, v * idm.tau + v * (v - leader.speed) / (2 * np.sqrt(idm.accel * idm.decel)))
-                a = idm.accel * (1 - (v / idm.maxSpeed) ** idm.delta - (s_star / (headway - leader.length)) ** 2)
-                noise = np.random.normal(0, idm.sigma)
-                ts.accel(veh, a + noise)
+        max_dist = (c.premerge_distance + c.merge_distance) if c.global_obs else 100
+        max_speed = c.max_speed
 
+        # Assign driver data now that the simulation is running
+        if not self.vehicle_driver_map:
+            self.assign_driver_data(psych_data)
+
+        # Sort the RL vehicles by ID
+        prev_rls = sorted([v for v in ts.vehicles.values() if v.type.id == 'rl'], key=lambda x: x.id)
+
+        observations = []
+        for rl, act in zip(prev_rls, args):
+            if c.handcraft:
+                continue
+            else:
+                if rl.type.id == 'human':
+                    # Handle human-driven vehicles
+                    lead_vehicle = rl.leader()
+                    if lead_vehicle:
+                        lead_speed, dist_to_lead = lead_vehicle.speed, lead_vehicle.dist
+                    else:
+                        lead_speed, dist_to_lead = max_speed, max_dist
+
+                    idm_acceleration = self.idm.calculate_acceleration(rl.speed, lead_speed, dist_to_lead)
+                    idm_speed = rl.speed + idm_acceleration * ts.delta_t
+
+                    # Retrieve psychological states for the specific driver
+                    valence, arousal, emotion_state = self.get_driver_state(rl.id)
+
+                    # Adjust IDM outputs based on psychological states
+                    if valence is not None:
+                        adjusted_accel, adjusted_speed = self.adjust_idm_output_with_psychology(
+                            idm_acceleration, idm_speed, valence, arousal, emotion_state, prediction_model
+                        )
+                        ts.accel(rl, adjusted_accel)
+                        rl.speed = adjusted_speed
+                    else:
+                        # Default to IDM outputs if no psychological states are available
+                        ts.accel(rl, idm_acceleration)
+                        rl.speed = idm_speed
+
+                    # Collect observation for human-driven vehicles
+                    emotion_mapping = {
+                        'AD': [1, 0, 0, 0, 0, 0, 0],
+                        'DD': [0, 1, 0, 0, 0, 0, 0],
+                        'FD': [0, 0, 1, 0, 0, 0, 0],
+                        'HD': [0, 0, 0, 1, 0, 0, 0],
+                        'ND': [0, 0, 0, 0, 1, 0, 0],
+                        'SAD': [0, 0, 0, 0, 0, 1, 0],
+                        'SD': [0, 0, 0, 0, 0, 0, 1]
+                    }
+                    emotion_encoded = emotion_mapping.get(emotion_state, [0, 0, 0, 0, 0, 0, 0])
+
+                    obs = {
+                        'adjusted_speed': rl.speed,
+                        'adjusted_accel': adjusted_accel if valence is not None else idm_acceleration,
+                        'valence': valence,
+                        'arousal': arousal,
+                        'emotion_state': np.array(emotion_encoded)
+                    }
+                else:
+                    # Handle non-human-driven vehicles (e.g., RL-driven)
+                    ts.accel(rl, act)
+                    rl.speed += act * ts.delta_t
+
+                    # Collect observation for non-human-driven vehicles
+                    obs = {
+                        'adjusted_speed': rl.speed,
+                        'adjusted_accel': act
+                    }
+
+                observations.append(obs)
+
+        # Advance the simulation by one step
+        self.ts.step()
+
+        # Extend agent information if applicable
         if self._agent_info is not None:
             self.extend_agent_info()
-        self.ts.step()
+
+        # Append step info if applicable
         self.append_step_info()
+
+        # Extend vehicle information if applicable
         if self._vehicle_info is not None:
             self.extend_vehicle_info()
+
+        # Increment the step counter
         self._step += 1
-        return c.observation_space.low, 0, False, None
+
+        # Prepare the observation space output
+        obs_array = np.array([list(o.values()) for o in observations], dtype=np.float32)
+
+        # Calculate rewards
+        reward = len(ts.new_arrived) - c.collision_coef * len(ts.new_collided)
+
+        # Return the namespace with observations and reward
+        return Namespace(obs=obs_array, reward=reward)
+
+
+
 
     def init_vehicles(self):
         """
@@ -1070,6 +1311,8 @@ class Env:
         If not successful, this method will be called again.
         """
         return True
+
+
 
     def reset_sumo(self):
         c = self.c
@@ -1082,14 +1325,30 @@ class Env:
             sumo_def.sumo_cmd = sumo_def.generate_sumo(**kwargs)
         self.tc = sumo_def.start_sumo(self.tc)
         if generate_def:
+            print("inside generate_def")
             self.sumo_paths = {k: p for k, p in kwargs.items() if k in SumoDef.file_args}
-            defs = {k: E.from_path(p) for k, p in self.sumo_paths.items()}
+            print("self.sumopath", self.sumo_paths)
+            print("sumo path items", self.sumo_paths.items())
+            
+            # Modify this section to handle both file paths and in-memory XML strings
+            defs = {}
+            for k, p in self.sumo_paths.items():
+                if isinstance(p, str) and p.endswith('.xml'):
+                    # If p is a path, parse it from the file
+                    defs[k] = E.from_path(p)
+                else:
+                    # If p is an in-memory XML string, parse it directly
+                    defs[k] = E.from_element(ElementTree.fromstring(str(p)))
+            
+            print("defs", defs)
             self.ts = TrafficState(c, self.tc, **defs)
         else:
             self.ts.reset(self.tc)
+            
         self.ts.setup()
         success = self.init_vehicles()
         return success
+
 
     def init_env(self):
         ts = self.ts

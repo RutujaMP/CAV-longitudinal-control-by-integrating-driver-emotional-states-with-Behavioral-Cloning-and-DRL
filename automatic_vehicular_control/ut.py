@@ -98,7 +98,7 @@ class NamedArrays(dict):
             if isinstance(v, NamedArrays):
                 v.to_torch(dtype, device)
             else:
-                if v.dtype == np.object:
+                if v.dtype == object:
                     self[k] = [torch.tensor(np.ascontiguousarray(x), device=device) for x in v]
                 else:
                     self[k] = torch.tensor(np.ascontiguousarray(v), device=device)
@@ -207,9 +207,6 @@ class DiagGaussianDist(Dist):
         return super().entropy().squeeze(dim=-1)
 
 def build_dist(space):
-    """
-    Build a nested distribution
-    """
     if isinstance(space, Box):
         class DiagGaussianDist_(DiagGaussianDist):
             model_output_size = np.prod(space.shape) * 2
@@ -219,14 +216,16 @@ def build_dist(space):
             model_output_size = space.n
         return CatDist_
 
-    assert isinstance(space, dict) # Doesn't support lists at the moment since there's no list equivalent of NamedArrays that allows advanced indexing
+    assert isinstance(space, dict), "The observation space must be a dict if it's a mixed space."
     names, subspaces = zip(*space.items())
     to_list = lambda x: [x[name] for name in names]
     from_list = lambda x: NamedArrays(zip(names, x))
     subdist_classes = [build_dist(subspace) for subspace in subspaces]
     subsizes = [s.model_output_size for s in subdist_classes]
+
     class Dist_(Dist):
         model_output_size = sum(subsizes)
+        
         def __init__(self, inputs):
             super().__init__(inputs)
             self.dists = from_list(cl(x) for cl, x in zip(subdist_classes, inputs.split(subsizes, dim=-1)))
@@ -245,7 +244,10 @@ def build_dist(space):
 
         def entropy(self):
             return sum(dist.entropy() for dist in to_list(self.dists))
+
     return Dist_
+
+
 
 def build_fc(input_size, *sizes_and_modules):
     """
@@ -264,11 +266,30 @@ def build_fc(input_size, *sizes_and_modules):
 class FFN(nn.Module):
     def __init__(self, c):
         super().__init__()
+
         self.c = c.setdefaults(layers=[64, 'tanh', 64, 'tanh'], weight_scale='default', weight_init='orthogonal')
         layers = c.layers
         if isinstance(layers, list):
             layers = Namespace(s=[], v=layers, p=layers)
-        s_sizes = [c.observation_space.shape[0], *layers.s]
+
+        
+        from automatic_vehicular_control.env import current_vehicle_type
+        if current_vehicle_type == 'human':
+             self.observation_space = Dict({
+                'adjusted_speed': (0, 150),
+                'adjusted_accel': (-10, 10),
+                'valence': (1, 9),
+                'arousal': (1, 9),
+                'emotion_state': (0, 1, 7)  # Assuming 7 possible states
+            })
+        else:
+            print("FFN entered else")
+            self.observation_space = Box(low=c.low, high=1, shape=(c._n_obs_non_human,), dtype=np.float32)
+            print("setting the c.observation_space in FFN",self.observation_space)
+        
+        # Adjust the size of the input layer to match the updated observation space
+        observation_space_size = self.observation_space.shape[0]  # Updated observation space size
+        s_sizes = [observation_space_size, *layers.s]
 
         self.shared = build_fc(*s_sizes)
 
@@ -311,6 +332,7 @@ class FFN(nn.Module):
                 dist = self.c.dist_class(pred.policy)
                 pred.action = dist.argmax() if argmax else dist.sample()
         return pred
+
 
 def calc_adv(reward, gamma, value_=None, lam=None):
     """
